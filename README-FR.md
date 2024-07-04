@@ -4,7 +4,7 @@ Ce repo contient le code d'exemple illustrant
 l'enrichissement d'un événement de type "Notification" 
 pour en faire un événement de type "Event-carried State 
 Transfer" (ou "événement pleinement qualifié") détaillé 
-dans le [billet de blog disponible sur dev.to](https://dev.to/aws-builders/architecture-orientee-evenement-reconcilier-notifications-et-evenements-complets-79b-temp-slug-3688705?preview=557bcfdf9114fb9093567433dfe21b27b8a497d26a0f685fa7a18c7a3b28846d22fbeca68d79d52f7e5340db4ce8d25970ce20b12cd42bdb880929de).
+dans le [billet de blog disponible sur dev.to](https://dev.to/aws-builders/architecture-orientee-evenement-reconcilier-notifications-et-evenements-complets-1718).
 
 ## Contenu 
 

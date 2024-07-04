@@ -4,7 +4,7 @@ This repo contains source code showing how to enrich
 a "Notification" event to obtain an "Event-carried State
 Transfer" (or "fully-qualified") kind of event.
 
-It illustrates this [blog post published on dev.to](https://dev.to/aws-builders/architecture-orientee-evenement-reconcilier-notifications-et-evenements-complets-79b-temp-slug-3688705?preview=557bcfdf9114fb9093567433dfe21b27b8a497d26a0f685fa7a18c7a3b28846d22fbeca68d79d52f7e5340db4ce8d25970ce20b12cd42bdb880929de).
+It illustrates this [blog post published on dev.to](https://dev.to/aws-builders/event-driven-architecture-reconcile-notification-and-event-carried-state-transfer-patterns-5697).
 
 ## Contents
 2 CloudFormaton stacks (one with a minimal example, the other one with
