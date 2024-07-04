@@ -1,0 +1,400 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  EventBridge Bus with all features (logging, archiving, DLQ). 
+  - EB Rules invoke APIs to enrich event, reconciling Notification events with Event-Carried State Transfer.
+    - Here APIs are deployed as API Gateway + Lambda. API Gateway allows for synchronous Lambda invokation, 
+    hence benefitting from EventBridge's built-in retry capabilities. 
+    - Warning! Lambdas behind the API Gateway should return a result within 5s (otherwise EventBridge will 
+    consider invocations as failing and retry a new invocation).
+  - When we have a fully-qualified event, then we can perform Event-Carried State Transfer
+    - Here we transfer event to a single app which is behind the same API Gateway
+Parameters:
+  S3BucketContainingLayerZip:
+    Type: String
+  S3KeyofLayerZip:
+    Type: String
+  EmailForDLQNotification:
+    Type: String
+Resources:
+  EventBridgeBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: business-event-bus
+  CloudWatchBusLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/events/business-event-bus-log
+      RetentionInDays: 7
+  CloudWatchLogResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: CloudWatchLogsPolicyForEventBridge
+      PolicyDocument: !Sub >
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": ["events.amazonaws.com", "delivery.logs.amazonaws.com"]
+              },
+              "Action": [
+                "logs:PutLogEvents",
+                "logs:CreateLogStream"
+              ],
+              "Resource": "${CloudWatchBusLogGroup.Arn}"
+            }
+          ]
+        }
+  EventBridgeRuleToLogAllEvents:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: business-event-bus-log-all-events
+      EventBusName: !Ref EventBridgeBus
+      EventPattern: !Sub >
+        {
+          "source": [{"prefix": ""}]
+        }
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CloudWatchBusLogGroup.Arn
+          Id: CloudWatchLogGroup
+  EventBridgeBusArchive:
+    Type: AWS::Events::Archive
+    Properties:
+      SourceArn: !GetAtt EventBridgeBus.Arn
+      ArchiveName: business-event-bus-archive
+      Description: Business Event Bus Archive
+      RetentionDays: 7
+  EventBridgeDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Description: A queue to store all failed events. Configured Rule Destinations to use this queue.
+    Properties:
+      QueueName: business-event-bus-dlq
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref EmailForDLQNotification
+          Protocol: email
+  QueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: business-event-bus-queue-depth
+      AlarmDescription: "Alarm if the EventBridge Bus queue depth is greater than 1"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt EventBridgeDeadLetterQueue.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+      InsufficientDataActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+  AwsSdkLambdaLayer:
+    Type: AWS::Lambda::LayerVersion
+    Description: A simple aws-sdk nodejs bundle. We use this to keep other Lambdas light, and their code readable in the console
+    Properties:
+      CompatibleRuntimes:
+        - "nodejs18.x"
+      LayerName: "aws-sdk"
+      Content:
+        S3Bucket: !Ref S3BucketContainingLayerZip
+        S3Key: !Ref S3KeyofLayerZip
+  LambdaEnrichEventWithPaymentData:
+    Type: AWS::Lambda::Function
+    Description: This lambda returns dummy payment data. IRL, it'd fetch data from Payment System
+    Properties:
+      FunctionName: EnrichEventWithPaymentData
+      Runtime: nodejs18.x
+      Layers:
+        - !Ref AwsSdkLambdaLayer
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const eventBridge = new AWS.EventBridge();
+          exports.handler = async (event) => {
+          
+              const input = JSON.parse(event.body);
+              console.log("#EVENT RECEIVED\n" + JSON.stringify(input));
+          
+              var detailToSend = input['detail'];
+          
+              try {
+                  detailToSend['payment_data'] = { // In Real Life: fetch data from Payment System 
+                      "id": "2237082",
+                      "type": "Credit",
+                      "description": "Credit Card - HSBC",
+                      "status": "Confirm",
+                      "state": "Paid",
+                      "value": 1700,
+                      "currency": "EUR",
+                      "date": "2018-12-15"
+                  };
+          
+                  const eventsToSend = {
+                      "Entries": [{
+                          "Detail": JSON.stringify(detailToSend),
+                          "DetailType": input['detail-type'],
+                          "Source": input['source'],
+                          "EventBusName": 'business-event-bus'
+                      }]
+                  };
+                  console.log("#EVENT TO SEND\n" + JSON.stringify(eventsToSend['Entries'][0]));
+                  const response = await eventBridge.putEvents(eventsToSend).promise();
+
+              } catch (e) { 
+                  console.log("ERROR: " + e);
+                  return {
+                      statusCode: 500,
+                      body: JSON.stringify(e)
+                  }
+              }
+
+              return {
+                  statusCode: 200,
+                  body: "Enriched event with Payment data and posted it to the bus"
+              };
+          }
+      Handler: index.handler
+      Role: !GetAtt 'LambdaEnrichRole.Arn'
+  LambdaEnrichRole:
+    Type: AWS::IAM::Role
+    Description: Lambdas needs to PutEvent to EventBridge
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns: #Standard Lambda execution policy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaEventBridgePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: #Allow write to EventBridge bus defined in eventbridge stack
+                  - events:PutEvents
+                Resource: !GetAtt EventBridgeBus.Arn
+  LambdaDispatchRole:
+    Type: AWS::IAM::Role
+    Description: Lambdas with this role don't need to write to EventBridge, as they just update downstream apps.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns: #Standard Lambda execution policy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  LambdaDispatchEventToApp:
+    Type: AWS::Lambda::Function
+    Description: Event-carried state transfer to App
+    Properties:
+      FunctionName: DispatchEventToApp
+      Runtime: nodejs18.x
+      Layers:
+        - !Ref AwsSdkLambdaLayer
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const eventBridge = new AWS.EventBridge();
+          exports.handler = async (event) => {
+          
+              const input = JSON.parse(event.body);
+              console.log("#EVENT RECEIVED\n" + JSON.stringify(input));
+          
+          
+              try {
+                  // Implement App-specific business logic here 
+
+              } catch (e) { 
+                  console.log("ERROR: " + e);
+                  return {
+                      statusCode: 500,
+                      body: JSON.stringify(e)
+                  }
+              }
+
+              return {
+                  statusCode: 200,
+                  body: "App synced"
+              };
+          }
+      Handler: index.handler
+      Role: !GetAtt 'LambdaDispatchRole.Arn'
+#### API GATEWAY SECTION ####
+  EventBridgeAPIRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEventBridgeFullAccess #Needed for API Destination only see https://docs.aws.amazon.com/eventbridge/latest/userguide/eb-use-identity-based.html#eb-managed-policies
+  EnrichEventApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: EnrichEventApi
+      Policy: #Allow EventBridgeAPIRole to call this API
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt 'EventBridgeAPIRole.Arn'
+            Action:
+              - execute-api:Invoke
+            Resource: 'execute-api:/*'
+  EnrichEventWithPaymentDataApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt 'EnrichEventApi.RootResourceId'
+      PathPart: 'enrich-payment'
+      RestApiId: !Ref 'EnrichEventApi'
+  EnrichEventWithPaymentDataApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: AWS_IAM
+      HttpMethod: POST
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaEnrichEventWithPaymentData.Arn}/invocations'
+      ResourceId: !GetAtt 'EnrichEventWithPaymentDataApiResource.ResourceId'
+      RestApiId: !Ref 'EnrichEventApi'
+  SyncAppApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt 'EnrichEventApi.RootResourceId'
+      PathPart: 'sync-app'
+      RestApiId: !Ref 'EnrichEventApi'
+  SyncAppApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: AWS_IAM
+      HttpMethod: POST
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaDispatchEventToApp.Arn}/invocations'
+      ResourceId: !GetAtt 'SyncAppApiResource.ResourceId'
+      RestApiId: !Ref 'EnrichEventApi'
+  EnrichEventApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - EnrichEventWithPaymentDataApiMethod
+    Properties:
+      RestApiId: !Ref 'EnrichEventApi'
+      StageName: prod
+  EnrichEventWithPaymentDataApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref 'LambdaEnrichEventWithPaymentData'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${EnrichEventApi}/*/POST/*'
+  SyncAppApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref 'LambdaDispatchEventToApp'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${EnrichEventApi}/*/POST/*'
+
+  EventBridgeDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Description: Allow EventBridge rules to send failed events to DLQ
+    Properties:
+      Queues:
+        - !Ref EventBridgeDeadLetterQueue
+      PolicyDocument:
+        Statement:
+          - Action:
+              - sqs:SendMessage
+            Effect: Allow
+            Resource: !GetAtt EventBridgeDeadLetterQueue.Arn
+            Principal:
+              Service: events.amazonaws.com
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  - !GetAtt EnrichPaymentRule.Arn
+                  - !GetAtt SyncTargetRule.Arn
+  EnrichPaymentRule:
+    Type: AWS::Events::Rule
+    Description: Add Payment data
+    Properties:
+      Name: needs-payment-data
+      Description: Enrich event with Payment data
+      EventPattern:
+        !Sub |
+        {
+          "detail-type": ["PAYMENT"],
+          "detail.payment_data.id": [{ "exists": false }]
+        }
+      State: ENABLED
+      EventBusName: business-event-bus
+      Targets:
+        - Arn:
+            Fn::Sub:
+              - arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/prod/POST/enrich-payment
+              - ApiGatewayRestApi: !Ref 'EnrichEventApi'
+          Id: 'EnrichWithPaymentData'
+          RoleArn: !GetAtt 'EventBridgeAPIRole.Arn'
+          DeadLetterConfig:
+            Arn: !GetAtt EventBridgeDeadLetterQueue.Arn
+  SyncTargetRule:
+    Type: AWS::Events::Rule
+    Description: Perform Event-carried State Transfer to App
+    Properties:
+      Name: push-fully-qualified-event-to-systems
+      Description: Send fully qualified event to all apps
+      EventPattern:
+        !Sub |
+        {
+          "detail-type": [
+            "PAYMENT"
+          ],
+          "detail.payment_data.id": [
+            {
+              "exists": true
+            }
+          ]
+        }
+      State: ENABLED
+      EventBusName: !Ref EventBridgeBus
+      Targets:
+        - Arn:
+            Fn::Sub:
+              - arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/prod/POST/sync-app
+              - ApiGatewayRestApi: !Ref 'EnrichEventApi'
+          Id: 'sync-app'
+          RoleArn: !GetAtt 'EventBridgeAPIRole.Arn'
+          DeadLetterConfig:
+            Arn: !GetAtt EventBridgeDeadLetterQueue.Arn
